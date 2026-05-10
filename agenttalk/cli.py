@@ -134,7 +134,31 @@ def cmd_list(args):
     emit([dict(r) for r in rows])
 
 
+def _resolve_body(args):
+    """Resolve message body from --body or --body-file. Never reads stdin
+    implicitly: argparse's required mutually-exclusive group enforces that
+    exactly one of the two is provided.
+    """
+    if args.body is not None:
+        return args.body
+    path = args.body_file
+    if path == "-":
+        return sys.stdin.read()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    except FileNotFoundError:
+        emit({"error": f"body file not found: {path}"}, exit_code=1)
+    except IsADirectoryError:
+        emit({"error": f"body file is a directory: {path}"}, exit_code=1)
+    except UnicodeDecodeError as e:
+        emit({"error": f"body file is not valid UTF-8: {e}"}, exit_code=1)
+
+
 def cmd_send(args):
+    body = _resolve_body(args)
+    body_bytes = len(body.encode("utf-8"))
+
     with connect() as conn:
         sender = resolve_identity(args, conn)
         if not sender:
@@ -145,6 +169,11 @@ def cmd_send(args):
         recipients = [t.strip() for t in args.to.split(",") if t.strip()]
         if not recipients:
             emit({"error": "no recipients"}, exit_code=1)
+        if args.wait and len(recipients) != 1:
+            emit(
+                {"error": "--wait requires exactly one recipient"},
+                exit_code=1,
+            )
         for to in recipients:
             row = conn.execute("SELECT 1 FROM agents WHERE name=?", (to,)).fetchone()
             if not row:
@@ -165,16 +194,41 @@ def cmd_send(args):
             cur = conn.execute(
                 "INSERT INTO messages(from_agent, to_agent, body, sent_at, in_reply_to) "
                 "VALUES(?,?,?,?,?)",
-                (sender, to, args.body, ts, in_reply_to),
+                (sender, to, body, ts, in_reply_to),
             )
             ids.append(cur.lastrowid)
-    emit({
+
+    out = {
         "from": sender,
         "to": recipients,
         "message_ids": ids,
         "sent_at": ts,
         "in_reply_to": in_reply_to,
-    })
+        "body_bytes": body_bytes,
+    }
+
+    if args.wait:
+        out["wait"] = _wait_for_consume(ids[0], args.wait_timeout)
+
+    emit(out)
+
+
+def _wait_for_consume(message_id, timeout):
+    """Block until the recipient calls recv on this message (read_at set)
+    or the timeout elapses. 'Consumed' here means delivered, not understood.
+    """
+    deadline = time.time() + max(0, timeout)
+    poll_interval = 0.2
+    while True:
+        with connect() as conn:
+            row = conn.execute(
+                "SELECT read_at FROM messages WHERE id=?", (message_id,)
+            ).fetchone()
+            if row and row["read_at"] is not None:
+                return {"consumed_at": row["read_at"], "timed_out": False}
+        if time.time() >= deadline:
+            return {"consumed_at": None, "timed_out": True}
+        time.sleep(poll_interval)
 
 
 def _fetch_unread(conn, me):
@@ -312,13 +366,32 @@ def build_parser():
     ps = sub.add_parser("send", help="send a message to one or more agents")
     ps.add_argument("--as", dest="as_name", help="sender (defaults to whoami)")
     ps.add_argument("--to", required=True, help="recipient name(s), comma-separated")
-    ps.add_argument("--body", required=True, help="message body")
+    body_src = ps.add_mutually_exclusive_group(required=True)
+    body_src.add_argument("--body", default=None, help="message body (one-liner)")
+    body_src.add_argument(
+        "--body-file",
+        dest="body_file",
+        default=None,
+        help="read body from a UTF-8 file; use '-' for stdin",
+    )
     ps.add_argument(
         "--in-reply-to",
         dest="in_reply_to",
         type=int,
         default=None,
         help="optional message id this message is a reply to",
+    )
+    ps.add_argument(
+        "--wait",
+        action="store_true",
+        help="block until the (single) recipient consumes via recv",
+    )
+    ps.add_argument(
+        "--wait-timeout",
+        dest="wait_timeout",
+        type=int,
+        default=60,
+        help="max seconds to wait for consumption (default: 60)",
     )
     ps.set_defaults(func=cmd_send)
 

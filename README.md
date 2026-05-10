@@ -86,7 +86,7 @@ code.
 | `register --as <name> --purpose "..."` | Register or update this agent's identity. Idempotent for the same `(session_id, name)` pair. Errors if the session is already registered under a different name (use `rename`) or if the name is owned by another session. |
 | `whoami` | Returns the agent registered for the current session ID. Exits non-zero if unregistered. |
 | `list [--since 1h]` | List registered agents with name, purpose, and timestamps. `--since` filters to those seen within a window (`30s`, `5m`, `2h`, `1d`). |
-| `send [--as X] --to a[,b,c] --body "..." [--in-reply-to <id>]` | Send a message to one or more agents. Sender defaults to `whoami`. Errors if any recipient is not registered. `--in-reply-to` attaches the new message to a prior message ID — see [Lightweight threading](#lightweight-threading). |
+| `send [--as X] --to a[,b,c] (--body "..." \| --body-file PATH) [--in-reply-to <id>] [--wait [--wait-timeout N]]` | Send a message to one or more agents. Sender defaults to `whoami`. Exactly one of `--body` (one-liner) or `--body-file` (path, or `-` for stdin) must be provided — agenttalk never reads stdin implicitly. Output includes `body_bytes` (UTF-8 length) for cheap integrity checks. `--in-reply-to` attaches a prior message id (see [Lightweight threading](#lightweight-threading)). `--wait` blocks until the recipient consumes the message via `recv` (single recipient only) — see [Send and wait](#send-and-wait). |
 | `recv [--as X] [--timeout 60]` | Block up to `timeout` seconds for unread messages. Auto-acks (marks as read) before returning. Returns `{"timed_out": true, "messages": []}` on expiry. |
 | `peek [--as X]` | Return unread messages without acking. |
 | `rename [--as <old>] --to <new>` | Rename an agent. Cascades through message history in a single transaction. |
@@ -137,6 +137,51 @@ agenttalk send --as alice --to bob --body "what timezone are you in?"
 # bob replies, linking back to message 1
 agenttalk send --as bob --to alice --body "PST" --in-reply-to 1
 ```
+
+## Sending bigger or trickier bodies
+
+For anything beyond a one-liner — multi-line text, embedded quotes,
+generated content — use `--body-file` instead of `--body`:
+
+```sh
+# from a file
+agenttalk send --to bob --body-file ./review-notes.md
+
+# from stdin
+some-generator | agenttalk send --to bob --body-file -
+```
+
+Stdin is read **only** when `--body-file -` is passed explicitly. agenttalk
+will never read stdin if neither `--body` nor `--body-file` is given — that
+behavior would hang agent harnesses. Argparse rejects the call with a clean
+error in that case.
+
+The send response includes `body_bytes` (the UTF-8 length of the message
+body). Agents can compare this with the original to catch obvious corruption
+or truncation bugs in the harness.
+
+## Send and wait
+
+`agenttalk send ... --wait` blocks until the recipient consumes the message
+via `recv` (i.e. `read_at` is set), or until `--wait-timeout` (default 60s)
+elapses. The output gains a `wait` block:
+
+```json
+{
+  ...,
+  "wait": { "consumed_at": 1778402203, "timed_out": false }
+}
+```
+
+Important caveats:
+
+- **"Consumed" means delivered, not understood or acted on.** It only tells
+  you the recipient pulled the message into its context. Whether the agent
+  did something useful with it is out of scope — model that with a reply
+  message if you need it.
+- **Single recipient only in v1.** `--wait` errors out on multicast `--to`
+  lists. Wait semantics for fan-out are deferred until there's a clear use
+  case.
 
 ## Telling an agent how to use it
 
