@@ -20,15 +20,27 @@ CREATE TABLE IF NOT EXISTS agents (
 CREATE INDEX IF NOT EXISTS agents_session ON agents(session_id);
 
 CREATE TABLE IF NOT EXISTS messages (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    from_agent TEXT NOT NULL,
-    to_agent   TEXT NOT NULL,
-    body       TEXT NOT NULL,
-    sent_at    INTEGER NOT NULL,
-    read_at    INTEGER
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    from_agent  TEXT NOT NULL,
+    to_agent    TEXT NOT NULL,
+    body        TEXT NOT NULL,
+    sent_at     INTEGER NOT NULL,
+    read_at     INTEGER,
+    in_reply_to INTEGER
 );
 CREATE INDEX IF NOT EXISTS messages_to_unread ON messages(to_agent, read_at);
 """
+
+
+def _migrate(conn):
+    """Apply additive migrations for DBs created by older versions."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(messages)").fetchall()}
+    if "in_reply_to" not in cols:
+        try:
+            conn.execute("ALTER TABLE messages ADD COLUMN in_reply_to INTEGER")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc).lower():
+                raise
 
 
 def connect():
@@ -38,4 +50,8 @@ def connect():
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.executescript(SCHEMA)
+    _migrate(conn)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS messages_in_reply_to ON messages(in_reply_to)"
+    )
     return conn

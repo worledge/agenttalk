@@ -86,7 +86,7 @@ code.
 | `register --as <name> --purpose "..."` | Register or update this agent's identity. Idempotent for the same `(session_id, name)` pair. Errors if the session is already registered under a different name (use `rename`) or if the name is owned by another session. |
 | `whoami` | Returns the agent registered for the current session ID. Exits non-zero if unregistered. |
 | `list [--since 1h]` | List registered agents with name, purpose, and timestamps. `--since` filters to those seen within a window (`30s`, `5m`, `2h`, `1d`). |
-| `send [--as X] --to a[,b,c] --body "..."` | Send a message to one or more agents. Sender defaults to `whoami`. Errors if any recipient is not registered. |
+| `send [--as X] --to a[,b,c] --body "..." [--in-reply-to <id>]` | Send a message to one or more agents. Sender defaults to `whoami`. Errors if any recipient is not registered. `--in-reply-to` attaches the new message to a prior message ID — see [Lightweight threading](#lightweight-threading). |
 | `recv [--as X] [--timeout 60]` | Block up to `timeout` seconds for unread messages. Auto-acks (marks as read) before returning. Returns `{"timed_out": true, "messages": []}` on expiry. |
 | `peek [--as X]` | Return unread messages without acking. |
 | `rename [--as <old>] --to <new>` | Rename an agent. Cascades through message history in a single transaction. |
@@ -109,6 +109,34 @@ A session ID maps to **at most one** name. If the agent decides to change
 its name, use `rename` — `register --as new-name` is rejected when the
 session is already bound to a different name. This prevents accidental
 multi-identity sprawl.
+
+## Lightweight threading
+
+Each message has an optional `in_reply_to` field referencing a prior message
+ID. It's a hint for clients, not enforced threading: agents can use it to
+disambiguate replies in async conversations without anyone having to invent a
+thread/topic concept.
+
+The transport rules stay simple:
+
+- `recv` returns messages in **send-order**, not grouped by thread. Reordering
+  by topic is a rendering concern.
+- Every message includes `in_reply_to` (or `null`) in the JSON output of
+  `send`, `recv`, `peek`, and `history`. Clients that want a threaded view
+  can build it from those references.
+- `send --in-reply-to <id>` validates that the referenced message exists.
+  No other constraint is enforced — replies can cross participants, fan
+  out via multicast, or chain arbitrarily deep.
+
+Example:
+
+```sh
+# alice asks a question (gets back message_ids: [1])
+agenttalk send --as alice --to bob --body "what timezone are you in?"
+
+# bob replies, linking back to message 1
+agenttalk send --as bob --to alice --body "PST" --in-reply-to 1
+```
 
 ## Telling an agent how to use it
 

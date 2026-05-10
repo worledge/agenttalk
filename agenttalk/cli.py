@@ -149,21 +149,37 @@ def cmd_send(args):
             row = conn.execute("SELECT 1 FROM agents WHERE name=?", (to,)).fetchone()
             if not row:
                 emit({"error": f"recipient '{to}' not registered"}, exit_code=1)
+        in_reply_to = args.in_reply_to
+        if in_reply_to is not None:
+            ref = conn.execute(
+                "SELECT id FROM messages WHERE id=?", (in_reply_to,)
+            ).fetchone()
+            if not ref:
+                emit(
+                    {"error": f"in_reply_to message id {in_reply_to} does not exist"},
+                    exit_code=1,
+                )
         ids = []
         ts = now()
         for to in recipients:
             cur = conn.execute(
-                "INSERT INTO messages(from_agent, to_agent, body, sent_at) "
-                "VALUES(?,?,?,?)",
-                (sender, to, args.body, ts),
+                "INSERT INTO messages(from_agent, to_agent, body, sent_at, in_reply_to) "
+                "VALUES(?,?,?,?,?)",
+                (sender, to, args.body, ts, in_reply_to),
             )
             ids.append(cur.lastrowid)
-    emit({"from": sender, "to": recipients, "message_ids": ids, "sent_at": ts})
+    emit({
+        "from": sender,
+        "to": recipients,
+        "message_ids": ids,
+        "sent_at": ts,
+        "in_reply_to": in_reply_to,
+    })
 
 
 def _fetch_unread(conn, me):
     return conn.execute(
-        "SELECT id, from_agent, to_agent, body, sent_at FROM messages "
+        "SELECT id, from_agent, to_agent, body, sent_at, in_reply_to FROM messages "
         "WHERE to_agent=? AND read_at IS NULL ORDER BY id",
         (me,),
     ).fetchall()
@@ -250,8 +266,8 @@ def cmd_history(args):
         if not me:
             emit({"error": "could not resolve identity"}, exit_code=1)
         sql = (
-            "SELECT id, from_agent, to_agent, body, sent_at, read_at FROM messages "
-            "WHERE (from_agent=? OR to_agent=?)"
+            "SELECT id, from_agent, to_agent, body, sent_at, read_at, in_reply_to "
+            "FROM messages WHERE (from_agent=? OR to_agent=?)"
         )
         params = [me, me]
         if args.with_:
@@ -297,6 +313,13 @@ def build_parser():
     ps.add_argument("--as", dest="as_name", help="sender (defaults to whoami)")
     ps.add_argument("--to", required=True, help="recipient name(s), comma-separated")
     ps.add_argument("--body", required=True, help="message body")
+    ps.add_argument(
+        "--in-reply-to",
+        dest="in_reply_to",
+        type=int,
+        default=None,
+        help="optional message id this message is a reply to",
+    )
     ps.set_defaults(func=cmd_send)
 
     pre = sub.add_parser(
