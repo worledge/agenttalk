@@ -3,6 +3,7 @@ import argparse
 import json
 import sys
 import time
+from datetime import datetime
 
 from .db import connect
 from .identity import resolve_session_id
@@ -314,33 +315,200 @@ def cmd_rename(args):
     emit({"renamed": True, "from": old_name, "to": new_name})
 
 
+def _collect_thread(conn, msg_id):
+    """BFS from msg_id following in_reply_to to parents and the inverse
+    relation to children. Returns a sorted list of message IDs in the
+    thread, or [] if msg_id doesn't exist.
+    """
+    root = conn.execute("SELECT id FROM messages WHERE id=?", (msg_id,)).fetchone()
+    if not root:
+        return []
+    seen = set()
+    frontier = {msg_id}
+    while frontier:
+        next_frontier = set()
+        for mid in frontier:
+            if mid in seen:
+                continue
+            seen.add(mid)
+            parent = conn.execute(
+                "SELECT in_reply_to FROM messages WHERE id=?", (mid,)
+            ).fetchone()
+            if parent and parent["in_reply_to"] is not None:
+                next_frontier.add(parent["in_reply_to"])
+            children = conn.execute(
+                "SELECT id FROM messages WHERE in_reply_to=?", (mid,)
+            ).fetchall()
+            for c in children:
+                next_frontier.add(c["id"])
+        frontier = next_frontier - seen
+    return sorted(seen)
+
+
+def _compute_depths(messages):
+    """Map message id -> depth in the thread tree, using in_reply_to.
+    Messages whose parent is outside the result set get depth 0.
+    """
+    by_id = {m["id"]: m for m in messages}
+    depths = {}
+
+    def depth_of(mid):
+        if mid in depths:
+            return depths[mid]
+        m = by_id.get(mid)
+        if m is None or m["in_reply_to"] is None or m["in_reply_to"] not in by_id:
+            d = 0
+        else:
+            d = depth_of(m["in_reply_to"]) + 1
+        depths[mid] = d
+        return d
+
+    for mid in by_id:
+        depth_of(mid)
+    return depths
+
+
+def _fmt_ts(ts):
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _render_text(messages, threaded=False):
+    if not messages:
+        return "(no messages)\n"
+    depths = _compute_depths(messages) if threaded else {}
+    parts = []
+    for m in messages:
+        depth = depths.get(m["id"], 0)
+        indent = "  " * depth
+        header = (
+            f"{indent}[#{m['id']}  {_fmt_ts(m['sent_at'])}]  "
+            f"{m['from_agent']} → {m['to_agent']}"
+        )
+        if m["in_reply_to"]:
+            header += f"  (reply to #{m['in_reply_to']})"
+        body_lines = m["body"].splitlines() or [""]
+        body = "\n".join(f"{indent}    {line}" for line in body_lines)
+        parts.append(header + "\n" + body)
+    return "\n\n".join(parts) + "\n"
+
+
+def _render_markdown(messages, threaded=False):
+    if not messages:
+        return "*(no messages)*\n"
+    depths = _compute_depths(messages) if threaded else {}
+    parts = []
+    for m in messages:
+        depth = depths.get(m["id"], 0)
+        level = "#" * min(3 + depth, 6)
+        reply = f" *(reply to #{m['in_reply_to']})*" if m["in_reply_to"] else ""
+        header = (
+            f"{level} #{m['id']} · {_fmt_ts(m['sent_at'])} · "
+            f"{m['from_agent']} → {m['to_agent']}{reply}"
+        )
+        body_lines = m["body"].splitlines() or [""]
+        body = "\n".join(f"> {line}" if line else ">" for line in body_lines)
+        parts.append(header + "\n\n" + body)
+    return "\n\n".join(parts) + "\n"
+
+
 def cmd_history(args):
+    threaded = False
+    agent_label = None
+    scope_extras = {}
+
     with connect() as conn:
-        me = resolve_identity(args, conn)
-        if not me:
-            emit({"error": "could not resolve identity"}, exit_code=1)
+        if args.thread is not None:
+            ids = _collect_thread(conn, args.thread)
+            if ids:
+                placeholders = ",".join("?" * len(ids))
+                scope_sql = f"id IN ({placeholders})"
+                scope_params = list(ids)
+            else:
+                scope_sql = "0=1"
+                scope_params = []
+            threaded = True
+            scope_extras = {"thread": args.thread}
+        elif args.between:
+            names = [n.strip() for n in args.between.split(",") if n.strip()]
+            if len(names) < 2:
+                emit(
+                    {"error": "--between requires at least 2 comma-separated names"},
+                    exit_code=1,
+                )
+            ph = ",".join("?" * len(names))
+            scope_sql = f"from_agent IN ({ph}) AND to_agent IN ({ph})"
+            scope_params = names + names
+            scope_extras = {"between": names}
+        elif args.all:
+            scope_sql = "1=1"
+            scope_params = []
+            scope_extras = {"all": True}
+        else:
+            me = resolve_identity(args, conn)
+            if not me:
+                emit({"error": "could not resolve identity"}, exit_code=1)
+            agent_label = me
+            if args.with_:
+                scope_sql = (
+                    "((from_agent=? AND to_agent=?) OR "
+                    " (from_agent=? AND to_agent=?))"
+                )
+                scope_params = [me, args.with_, args.with_, me]
+                scope_extras = {"with": args.with_}
+            else:
+                scope_sql = "(from_agent=? OR to_agent=?)"
+                scope_params = [me, me]
+
+        where = scope_sql
+        params = list(scope_params)
+        if args.since:
+            cutoff = now() - parse_duration(args.since)
+            where = f"({where}) AND sent_at >= ?"
+            params.append(cutoff)
+
         sql = (
             "SELECT id, from_agent, to_agent, body, sent_at, read_at, in_reply_to "
-            "FROM messages WHERE (from_agent=? OR to_agent=?)"
+            f"FROM messages WHERE {where} ORDER BY id DESC LIMIT ?"
         )
-        params = [me, me]
-        if args.with_:
-            sql += " AND (from_agent=? OR to_agent=?)"
-            params += [args.with_, args.with_]
-        sql += " ORDER BY id DESC LIMIT ?"
         params.append(args.limit)
-        rows = conn.execute(sql, params).fetchall()
-    rows = [dict(r) for r in reversed(rows)]
-    emit({"agent": me, "messages": rows})
+        rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
+
+    rows.reverse()  # oldest first for display
+
+    if args.format == "json":
+        out = {"agent": agent_label, "messages": rows}
+        out.update(scope_extras)
+        emit(out)
+    elif args.format == "text":
+        sys.stdout.write(_render_text(rows, threaded=threaded))
+    else:  # md
+        sys.stdout.write(_render_markdown(rows, threaded=threaded))
 
 
 # --- argparse setup ---------------------------------------------------------
+
+
+EPILOG = """\
+Examples:
+  agenttalk register --as alice --purpose "frontend specialist"
+  agenttalk list --since 1h
+  agenttalk send --to bob --body "hey, can you look at PR #42?"
+  agenttalk send --to bob --body-file ./notes.md --in-reply-to 17
+  agenttalk recv --timeout 300
+  agenttalk history --with bob --format text
+  agenttalk history --thread 17 --format md
+  agenttalk history --between alice,bob,carol --since 1d
+
+Run `agenttalk <command> --help` for the flags supported by each command.
+"""
 
 
 def build_parser():
     p = argparse.ArgumentParser(
         prog="agenttalk",
         description="Inter-agent messaging CLI (mailbox-style, blocking recv).",
+        epilog=EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument(
         "--session",
@@ -419,12 +587,57 @@ def build_parser():
     prn.add_argument("--to", dest="new_name", required=True, help="new name")
     prn.set_defaults(func=cmd_rename)
 
-    ph = sub.add_parser("history", help="show past messages")
-    ph.add_argument("--as", dest="as_name")
-    ph.add_argument(
-        "--with", dest="with_", help="filter to conversation with this agent"
+    ph = sub.add_parser(
+        "history",
+        help=(
+            "show past messages — filter by peer, group, thread, time window, or all"
+        ),
     )
-    ph.add_argument("--limit", type=int, default=50)
+    ph.add_argument(
+        "--as",
+        dest="as_name",
+        help="view from this agent's perspective (defaults to whoami)",
+    )
+    scope = ph.add_mutually_exclusive_group()
+    scope.add_argument(
+        "--with",
+        dest="with_",
+        help="narrow to a 2-party conversation with this agent",
+    )
+    scope.add_argument(
+        "--between",
+        help="multi-party scope: comma-separated names; show messages whose "
+        "sender AND recipient are both in this set",
+    )
+    scope.add_argument(
+        "--thread",
+        type=int,
+        default=None,
+        help="show the full thread containing this message id "
+        "(walks in_reply_to in both directions)",
+    )
+    scope.add_argument(
+        "--all",
+        action="store_true",
+        help="drop the participant filter; show every message in the DB",
+    )
+    ph.add_argument(
+        "--since",
+        help="only include messages newer than this duration (e.g. 5m, 1h, 2d)",
+    )
+    ph.add_argument(
+        "--limit",
+        type=int,
+        default=50,
+        help="max messages to return (default: 50, applied after scope filters)",
+    )
+    ph.add_argument(
+        "--format",
+        choices=("json", "text", "md"),
+        default="json",
+        help="output format: json (default, structured), text (terminal "
+        "transcript), md (markdown transcript)",
+    )
     ph.set_defaults(func=cmd_history)
 
     return p

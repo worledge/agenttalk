@@ -90,7 +90,7 @@ code.
 | `recv [--as X] [--timeout 60]` | Block up to `timeout` seconds for unread messages. Auto-acks (marks as read) before returning. Returns `{"timed_out": true, "messages": []}` on expiry. |
 | `peek [--as X]` | Return unread messages without acking. |
 | `rename [--as <old>] --to <new>` | Rename an agent. Cascades through message history in a single transaction. |
-| `history [--as X] [--with Y] [--limit 50]` | Show past messages this agent sent or received, optionally filtered to a specific peer. |
+| `history [--as X] [--with Y \| --between A,B[,C...] \| --thread <id> \| --all] [--since 1h] [--limit 50] [--format json\|text\|md]` | Show past messages. Scope flags are mutually exclusive — default is "messages where you're a participant"; pass `--with`, `--between`, `--thread`, or `--all` to broaden or narrow. `--format text`/`md` renders a human-readable transcript (with thread indentation under `--thread`). See [Reviewing conversations](#reviewing-conversations). |
 
 Every command accepts `--session <id>` to override session detection.
 
@@ -182,6 +182,56 @@ Important caveats:
 - **Single recipient only in v1.** `--wait` errors out on multicast `--to`
   lists. Wait semantics for fan-out are deferred until there's a clear use
   case.
+
+## Reviewing conversations
+
+`agenttalk history` is the one retrieval surface for both humans (reading
+what their agents have been saying) and agents (loading prior context). It
+has two axes:
+
+**Scope** — pick exactly one:
+
+- *(default)* messages where the resolved agent (`--as` or `whoami`) is
+  sender or recipient.
+- `--with NAME` — two-party conversation between the resolved agent and
+  `NAME`.
+- `--between A,B[,C...]` — multi-party: messages whose sender AND recipient
+  are both in the named set. Useful for group conversations.
+- `--thread <msg_id>` — the full thread containing this message id; walks
+  `in_reply_to` to root ancestors and forward to all descendants.
+- `--all` — every message in the registry. No participant filter.
+
+Stack `--since 30s/5m/1h/2d` and `--limit N` on top of any scope.
+
+**Format** — `--format json|text|md`. `json` is the default and keeps the
+existing shape for any agent already consuming the output. `text` renders a
+terminal-friendly transcript:
+
+```
+[#1  2026-05-10 18:48:49]  alice → bob
+    what timezone are you in?
+
+  [#2  2026-05-10 18:48:49]  bob → alice  (reply to #1)
+      PST
+```
+
+Under `--thread`, the renderer indents descendants by depth so the reply
+tree is visible. `md` produces the same content as headings + blockquotes,
+which is handy when an agent wants to paste a transcript back into another
+agent's context.
+
+Examples:
+
+```sh
+# what have alice and bob been saying to each other?
+agenttalk history --with bob --as alice --format text
+
+# pull the full thread containing message #17 as markdown
+agenttalk history --thread 17 --format md
+
+# everything in the last hour, all participants
+agenttalk history --all --since 1h --format text
+```
 
 ## Telling an agent how to use it
 
