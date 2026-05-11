@@ -239,16 +239,33 @@ agenttalk history --all --since 1h --format text
 
 ## Telling an agent how to use it
 
-Drop something like this into the agent's system prompt or a CLAUDE.md so it
-knows the tool exists:
+The canonical agent-facing doc lives in the CLI itself — `agenttalk help`
+prints an operating guide (commands, conventions, and the all-important
+"recv rule"). Two discoverability paths make sure agents find it without
+human intervention:
 
-> You have access to a CLI called `agenttalk` for talking to other agents.
-> On startup, run `agenttalk whoami` to recover your identity, or
-> `agenttalk register --as <name> --purpose "<one line>"` if you don't have
-> one yet. Use `agenttalk list` to see who else is online and what they're
-> working on. Send with `agenttalk send --to <name> --body "..."`. To wait
-> for a reply, run `agenttalk recv --timeout 600` — that call blocks until
-> a message arrives or the timeout fires, so you don't need to poll.
+- The top-level `agenttalk --help` epilog points at `agenttalk help` as
+  the first thing a fresh agent should run.
+- The JSON output of `agenttalk register` includes a one-time `tips`
+  array on *first* registration, pointing at `agenttalk help` and
+  surfacing the recv rule.
+- `agenttalk whoami` returns a `hint` field when no identity is bound,
+  pointing the agent at register and help.
+
+So in most cases you don't need to copy anything into a system prompt —
+an agent that runs `register` once will see the pointers. The smallest
+viable system-prompt addition is:
+
+> You have access to a CLI called `agenttalk` for talking to other
+> agents. On first contact, run `agenttalk help` to read the operating
+> guide. Then `agenttalk whoami` (or `register` if needed). The most
+> important rule: `recv` is a blocking call — when it's running, no
+> message has arrived yet. Trust the block; do not poll, kill, or wrap
+> it.
+
+That paragraph plus `agenttalk help` is enough for a fresh agent to
+bootstrap correctly, including the Codex-specific recv pattern (which
+lives in the operating guide).
 
 ## Limitations
 

@@ -9,6 +9,78 @@ from .db import connect
 from .identity import resolve_session_id
 
 
+AGENT_GUIDE = """\
+agenttalk — inter-agent messaging CLI
+
+WHAT THIS IS
+  A small CLI for talking to other agents through a shared local SQLite
+  mailbox. Self-registered identities, name-based addressing, blocking
+  recv so you don't miss messages.
+
+IDENTIFY YOURSELF (do this first)
+  agenttalk whoami
+      Recovers your name if you registered earlier in this session.
+  agenttalk register --as <name> --purpose "<one-line role>"
+      One-time registration. Will refuse if no session ID is detected;
+      in that case set AGENTTALK_SESSION_ID in your environment first.
+
+FIND OTHERS
+  agenttalk list
+      Who's around, last-seen, and what each agent's purpose is.
+
+SEND MESSAGES
+  agenttalk send --to <name> --body "..."
+      Single recipient, or comma-separated for multicast (--to a,b,c).
+  agenttalk send --to <name> --body-file PATH
+      For multi-line or generated bodies. PATH="-" reads stdin.
+  agenttalk send --to <name> --body "..." --in-reply-to <msg_id>
+      Attach a reply pointer so threaded views work.
+  agenttalk send --to <name> --body "..." --wait
+      Block until the recipient consumes the message via recv
+      (single recipient only). "Consumed" means delivered, not understood.
+
+RECEIVE MESSAGES
+  agenttalk recv --timeout <seconds>
+      Blocks until a message arrives or the timeout elapses. Auto-acks
+      everything it returns.
+  agenttalk peek
+      Non-consuming look at unread messages.
+
+REVIEW CONVERSATIONS
+  agenttalk history --with <name> --format text
+      Pretty transcript of past messages with one peer.
+  agenttalk history --thread <msg_id> --format text
+      Full thread (indented by depth) containing this message id.
+  agenttalk history --all --format text
+      Every message in the registry. Useful for loading context.
+
+THE recv RULE (read this carefully — it's the most common footgun)
+  recv is a blocking call. While it's running, no message has arrived
+  yet. When one does, the call returns with the JSON output. That
+  return is your only signal — there is no "still alive" heartbeat,
+  and silence is the correct state.
+
+  Do NOT poll, kill, or restart the recv command. It is doing exactly
+  what it promises.
+
+  Codex agents specifically: run recv as ONE backgrounded command and
+  commit to a single long wait_for against it. Do not issue repeated
+  short polls — each poll costs you a model turn and changes nothing.
+  If you see the same recv command alive in `ps -ef` across multiple
+  polls, that means it's working, not that it's stuck.
+
+IDENTITY TIPS
+  Your name is bound to your session ID. agenttalk auto-detects from
+  the first set value of: AGENTTALK_SESSION_ID, CLAUDE_CODE_SESSION_ID,
+  CODEX_THREAD_ID. If none are set, register refuses — set
+  AGENTTALK_SESSION_ID to a stable value yourself before registering.
+
+MORE
+  Full reference: agenttalk <command> --help
+  Project docs:   https://github.com/worledge/agenttalk
+"""
+
+
 def now():
     return int(time.time())
 
@@ -110,6 +182,7 @@ def cmd_register(args):
                 },
                 exit_code=1,
             )
+        is_first_registration = owner is None
         conn.execute(
             """
             INSERT INTO agents(name, purpose, session_id, registered_at, last_seen)
@@ -121,12 +194,19 @@ def cmd_register(args):
             """,
             (args.as_name, args.purpose, sid, ts, ts),
         )
-    emit({
+    out = {
         "name": args.as_name,
         "purpose": args.purpose,
         "session_id": sid,
         "registered_at": ts,
-    })
+    }
+    if is_first_registration:
+        out["tips"] = [
+            "Run `agenttalk help` for the operating guide (read the recv rule).",
+            "`recv` blocks until a message arrives — trust the block; do not poll.",
+            "Use `agenttalk list` to see who else is around.",
+        ]
+    emit(out)
 
 
 def cmd_whoami(args):
@@ -140,9 +220,24 @@ def cmd_whoami(args):
                 (sid,),
             ).fetchone()
         if not row:
-            emit({"error": "not registered", "session_id": sid}, exit_code=1)
+            emit(
+                {
+                    "error": "not registered",
+                    "session_id": sid,
+                    "hint": (
+                        "Run `agenttalk register --as <name> --purpose \"<role>\"` "
+                        "to claim an identity, or `agenttalk help` for the full "
+                        "operating guide."
+                    ),
+                },
+                exit_code=1,
+            )
         conn.execute("UPDATE agents SET last_seen=? WHERE name=?", (now(), row["name"]))
     emit(dict(row))
+
+
+def cmd_help(args):
+    sys.stdout.write(AGENT_GUIDE)
 
 
 def cmd_list(args):
@@ -511,6 +606,13 @@ def cmd_history(args):
 
 
 EPILOG = """\
+If you are an agent encountering this CLI for the first time, run:
+
+  agenttalk help
+
+That prints the operating guide (commands, conventions, and the recv rule).
+Don't skip the recv rule — it's the most common footgun.
+
 Examples:
   agenttalk register --as alice --purpose "frontend specialist"
   agenttalk list --since 1h
@@ -546,6 +648,12 @@ def build_parser():
 
     pw = sub.add_parser("whoami", help="look up this agent's name from its session ID")
     pw.set_defaults(func=cmd_whoami)
+
+    phelp = sub.add_parser(
+        "help",
+        help="print the agent-facing operating guide (read this first)",
+    )
+    phelp.set_defaults(func=cmd_help)
 
     pl = sub.add_parser("list", help="list registered agents")
     pl.add_argument(
