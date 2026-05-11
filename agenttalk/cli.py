@@ -55,6 +55,28 @@ def resolve_identity(args, conn):
 
 def cmd_register(args):
     sid = resolve_session_id(args.session)
+    if not sid:
+        emit(
+            {
+                "error": (
+                    "no session ID detected. agenttalk needs a stable session "
+                    "ID to recover this agent's identity on later calls. Fix "
+                    "by either (a) setting AGENTTALK_SESSION_ID=<id> in this "
+                    "process's environment before registering, or (b) passing "
+                    "`--session <id>` to this and every subsequent agenttalk "
+                    "call. For Claude Code this is auto-detected via "
+                    "CLAUDE_CODE_SESSION_ID; for Codex it is "
+                    "CODEX_THREAD_ID (available in Codex CLI >= Feb 2026)."
+                ),
+                "checked_env_vars": [
+                    "AGENTTALK_SESSION_ID",
+                    "CLAUDE_CODE_SESSION_ID",
+                    "CODEX_THREAD_ID",
+                    "CODEX_SESSION_ID",
+                ],
+            },
+            exit_code=1,
+        )
     ts = now()
     with connect() as conn:
         if sid:

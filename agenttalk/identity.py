@@ -3,13 +3,16 @@
 Priority:
   1. AGENTTALK_SESSION_ID  (explicit override)
   2. CLAUDE_CODE_SESSION_ID (Claude Code)
-  3. CODEX_SESSION_ID       (Codex CLI)
+  3. CODEX_THREAD_ID        (Codex CLI, exposed since Feb 2026)
+  4. CODEX_SESSION_ID       (kept as a defensive fallback; not actually
+                             set by Codex today)
 """
 import os
 
 SESSION_ENV_VARS = (
     "AGENTTALK_SESSION_ID",
     "CLAUDE_CODE_SESSION_ID",
+    "CODEX_THREAD_ID",
     "CODEX_SESSION_ID",
 )
 

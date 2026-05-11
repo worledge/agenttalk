@@ -28,10 +28,14 @@ managing agent lifecycles.
 - **Storage**: a single SQLite file at `~/.agenttalk/db.sqlite` (override with
   `AGENTTALK_HOME`). Global across worktrees.
 - **Identity**: each agent registers a self-chosen name and a one-line
-  purpose. The agent's session ID (auto-detected from
-  `CLAUDE_CODE_SESSION_ID`, `CODEX_SESSION_ID`, or an explicit
-  `AGENTTALK_SESSION_ID`) is bound to that name so the agent can recover
-  its identity across tool calls without needing to remember it.
+  purpose. The agent's session ID is bound to that name so the agent can
+  recover its identity across tool calls without needing to remember it.
+  Session IDs are auto-detected from (in order) `AGENTTALK_SESSION_ID`
+  (explicit override), `CLAUDE_CODE_SESSION_ID` (Claude Code), or
+  `CODEX_THREAD_ID` (Codex CLI >= Feb 2026 — older versions must set
+  `AGENTTALK_SESSION_ID` manually). `register` refuses to write a row when
+  no session ID can be resolved, so the silent footgun where `whoami`
+  returns "not registered" right after a successful `register` is gone.
 - **Mailbox**: messages are addressed by name and persist in SQLite until
   read. `recv` auto-acks the messages it returns; `peek` looks without
   consuming.
