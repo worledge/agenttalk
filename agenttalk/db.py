@@ -15,9 +15,11 @@ CREATE TABLE IF NOT EXISTS agents (
     purpose       TEXT NOT NULL,
     session_id    TEXT,
     registered_at INTEGER NOT NULL,
-    last_seen     INTEGER NOT NULL
+    last_seen     INTEGER NOT NULL,
+    retired_at    INTEGER
 );
 CREATE INDEX IF NOT EXISTS agents_session ON agents(session_id);
+CREATE INDEX IF NOT EXISTS agents_retired ON agents(retired_at);
 
 CREATE TABLE IF NOT EXISTS messages (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -34,10 +36,18 @@ CREATE INDEX IF NOT EXISTS messages_to_unread ON messages(to_agent, read_at);
 
 def _migrate(conn):
     """Apply additive migrations for DBs created by older versions."""
-    cols = {row[1] for row in conn.execute("PRAGMA table_info(messages)").fetchall()}
-    if "in_reply_to" not in cols:
+    msg_cols = {row[1] for row in conn.execute("PRAGMA table_info(messages)").fetchall()}
+    if "in_reply_to" not in msg_cols:
         try:
             conn.execute("ALTER TABLE messages ADD COLUMN in_reply_to INTEGER")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc).lower():
+                raise
+
+    agent_cols = {row[1] for row in conn.execute("PRAGMA table_info(agents)").fetchall()}
+    if "retired_at" not in agent_cols:
+        try:
+            conn.execute("ALTER TABLE agents ADD COLUMN retired_at INTEGER")
         except sqlite3.OperationalError as exc:
             if "duplicate column name" not in str(exc).lower():
                 raise
@@ -53,5 +63,8 @@ def connect():
     _migrate(conn)
     conn.execute(
         "CREATE INDEX IF NOT EXISTS messages_in_reply_to ON messages(in_reply_to)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS agents_retired ON agents(retired_at)"
     )
     return conn

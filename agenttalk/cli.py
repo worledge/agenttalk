@@ -54,6 +54,21 @@ REVIEW CONVERSATIONS
   agenttalk history --all --format text
       Every message in the registry. Useful for loading context.
 
+RETIRE (clean up when you're done)
+  agenttalk retire
+      Self-retire — graceful shutdown for the current agent. Hides you
+      from `list`, clears your session binding. Reversible: re-register
+      the same name later (yourself or a successor) and you're back,
+      with all your prior message history intact. This is the
+      role-handover pattern: when a manager session ends, retire; when
+      a fresh session takes over, register with the same name.
+  agenttalk list --retired-only
+      See who's been retired.
+
+  (Humans can also run `agenttalk retire --inactive-since 7d` to bulk
+  clean up old agents, or `--hard` to delete rows entirely. Agents
+  rarely need those forms.)
+
 THE recv RULE (read this carefully — it's the most common footgun)
   recv is a blocking call. While it's running, no message has arrived
   yet. When one does, the call returns with the JSON output. That
@@ -185,12 +200,13 @@ def cmd_register(args):
         is_first_registration = owner is None
         conn.execute(
             """
-            INSERT INTO agents(name, purpose, session_id, registered_at, last_seen)
-            VALUES(?, ?, ?, ?, ?)
+            INSERT INTO agents(name, purpose, session_id, registered_at, last_seen, retired_at)
+            VALUES(?, ?, ?, ?, ?, NULL)
             ON CONFLICT(name) DO UPDATE SET
                 purpose    = excluded.purpose,
                 session_id = excluded.session_id,
-                last_seen  = excluded.last_seen
+                last_seen  = excluded.last_seen,
+                retired_at = NULL
             """,
             (args.as_name, args.purpose, sid, ts, ts),
         )
@@ -242,11 +258,21 @@ def cmd_help(args):
 
 def cmd_list(args):
     with connect() as conn:
-        sql = "SELECT name, purpose, session_id, registered_at, last_seen FROM agents"
+        sql = (
+            "SELECT name, purpose, session_id, registered_at, last_seen, "
+            "retired_at FROM agents"
+        )
+        where = []
         params = []
+        if args.retired_only:
+            where.append("retired_at IS NOT NULL")
+        elif not args.include_retired:
+            where.append("retired_at IS NULL")
         if args.since:
-            sql += " WHERE last_seen >= ?"
+            where.append("last_seen >= ?")
             params.append(now() - parse_duration(args.since))
+        if where:
+            sql += " WHERE " + " AND ".join(where)
         sql += " ORDER BY last_seen DESC"
         rows = conn.execute(sql, params).fetchall()
     emit([dict(r) for r in rows])
@@ -293,9 +319,22 @@ def cmd_send(args):
                 exit_code=1,
             )
         for to in recipients:
-            row = conn.execute("SELECT 1 FROM agents WHERE name=?", (to,)).fetchone()
+            row = conn.execute(
+                "SELECT retired_at FROM agents WHERE name=?", (to,)
+            ).fetchone()
             if not row:
                 emit({"error": f"recipient '{to}' not registered"}, exit_code=1)
+            if row["retired_at"] is not None:
+                emit(
+                    {
+                        "error": (
+                            f"recipient '{to}' is retired (set at "
+                            f"{row['retired_at']}). Ask them to re-register "
+                            f"if a successor is taking over the name."
+                        )
+                    },
+                    exit_code=1,
+                )
         in_reply_to = args.in_reply_to
         if in_reply_to is not None:
             ref = conn.execute(
@@ -430,6 +469,106 @@ def cmd_rename(args):
             conn.execute("ROLLBACK")
             raise
     emit({"renamed": True, "from": old_name, "to": new_name})
+
+
+def cmd_retire(args):
+    if args.purge_messages and not args.hard:
+        emit(
+            {"error": "--purge-messages requires --hard"},
+            exit_code=1,
+        )
+
+    ts = now()
+    with connect() as conn:
+        if args.inactive_since:
+            cutoff = now() - parse_duration(args.inactive_since)
+            rows = conn.execute(
+                "SELECT name FROM agents "
+                "WHERE last_seen < ? AND retired_at IS NULL "
+                "ORDER BY last_seen ASC",
+                (cutoff,),
+            ).fetchall()
+            targets = [r["name"] for r in rows]
+            scope = {"mode": "inactive_since", "duration": args.inactive_since,
+                     "cutoff_unix": cutoff}
+        elif args.name:
+            row = conn.execute(
+                "SELECT name FROM agents WHERE name=?", (args.name,)
+            ).fetchone()
+            if not row:
+                emit(
+                    {"error": f"no agent named '{args.name}'"},
+                    exit_code=1,
+                )
+            targets = [args.name]
+            scope = {"mode": "name", "name": args.name}
+        else:
+            me = resolve_identity(args, conn)
+            if not me:
+                emit(
+                    {
+                        "error": (
+                            "could not resolve identity for self-retire; pass "
+                            "--name <agent> or --inactive-since <duration>"
+                        )
+                    },
+                    exit_code=1,
+                )
+            targets = [me]
+            scope = {"mode": "self", "name": me}
+
+        if args.dry_run:
+            items = []
+            for name in targets:
+                item = {"name": name, "mode": "hard" if args.hard else "soft"}
+                if args.purge_messages:
+                    n = conn.execute(
+                        "SELECT COUNT(*) AS n FROM messages "
+                        "WHERE from_agent=? OR to_agent=?",
+                        (name, name),
+                    ).fetchone()["n"]
+                    item["would_delete_messages"] = n
+                items.append(item)
+            emit({
+                "dry_run": True,
+                "scope": scope,
+                "targets": items,
+                "purge_messages": bool(args.purge_messages),
+            })
+            return
+
+        results = []
+        for name in targets:
+            if args.hard:
+                msg_deleted = 0
+                if args.purge_messages:
+                    cur = conn.execute(
+                        "DELETE FROM messages WHERE from_agent=? OR to_agent=?",
+                        (name, name),
+                    )
+                    msg_deleted = cur.rowcount
+                conn.execute("DELETE FROM agents WHERE name=?", (name,))
+                results.append({
+                    "name": name,
+                    "action": "deleted",
+                    "messages_deleted": msg_deleted,
+                })
+            else:
+                conn.execute(
+                    "UPDATE agents SET retired_at=?, session_id=NULL WHERE name=?",
+                    (ts, name),
+                )
+                results.append({
+                    "name": name,
+                    "action": "retired",
+                    "retired_at": ts,
+                })
+
+    emit({
+        "scope": scope,
+        "results": results,
+        "purge_messages": bool(args.purge_messages),
+    })
 
 
 def _collect_thread(conn, msg_id):
@@ -659,6 +798,19 @@ def build_parser():
     pl.add_argument(
         "--since", help="only show agents seen within window (e.g. 5m, 1h, 2d)"
     )
+    visibility = pl.add_mutually_exclusive_group()
+    visibility.add_argument(
+        "--include-retired",
+        dest="include_retired",
+        action="store_true",
+        help="include retired agents in the output (hidden by default)",
+    )
+    visibility.add_argument(
+        "--retired-only",
+        dest="retired_only",
+        action="store_true",
+        help="show only retired agents",
+    )
     pl.set_defaults(func=cmd_list)
 
     ps = sub.add_parser("send", help="send a message to one or more agents")
@@ -708,6 +860,50 @@ def build_parser():
     pp = sub.add_parser("peek", help="show unread messages without consuming them")
     pp.add_argument("--as", dest="as_name", help="recipient (defaults to whoami)")
     pp.set_defaults(func=cmd_peek)
+
+    pret = sub.add_parser(
+        "retire",
+        help=(
+            "retire (soft) or delete (hard) an agent identity; re-registering "
+            "the same name resurrects it"
+        ),
+    )
+    scope = pret.add_mutually_exclusive_group()
+    scope.add_argument("--name", help="retire this specific agent by name")
+    scope.add_argument(
+        "--inactive-since",
+        dest="inactive_since",
+        help=(
+            "retire every non-retired agent whose last_seen is older than "
+            "this duration (e.g. 7d, 24h)"
+        ),
+    )
+    pret.add_argument(
+        "--as",
+        dest="as_name",
+        help="self-retire path: override session resolution (defaults to whoami)",
+    )
+    pret.add_argument(
+        "--hard",
+        action="store_true",
+        help="delete the agent row entirely instead of soft-retiring",
+    )
+    pret.add_argument(
+        "--purge-messages",
+        dest="purge_messages",
+        action="store_true",
+        help=(
+            "also delete the agent's message history (requires --hard); "
+            "soft retire never touches messages"
+        ),
+    )
+    pret.add_argument(
+        "--dry-run",
+        dest="dry_run",
+        action="store_true",
+        help="show what would change without modifying anything",
+    )
+    pret.set_defaults(func=cmd_retire)
 
     prn = sub.add_parser(
         "rename",

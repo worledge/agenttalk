@@ -94,6 +94,7 @@ code.
 | `recv [--as X] [--timeout 60]` | Block up to `timeout` seconds for unread messages. Auto-acks (marks as read) before returning. Returns `{"timed_out": true, "messages": []}` on expiry. |
 | `peek [--as X]` | Return unread messages without acking. |
 | `rename [--as <old>] --to <new>` | Rename an agent. Cascades through message history in a single transaction. |
+| `retire [--name X \| --inactive-since DURATION] [--hard] [--purge-messages] [--dry-run]` | Soft-retire an agent (hides from `list`, rejects new sends, reversible by re-registering the same name). Self-retires by default. `--inactive-since` bulk-retires stale agents. `--hard` deletes the row; `--purge-messages` (requires `--hard`) also wipes their message history. See [Cleaning up identities](#cleaning-up-identities). |
 | `history [--as X] [--with Y \| --between A,B[,C...] \| --thread <id> \| --all] [--since 1h] [--limit 50] [--format json\|text\|md]` | Show past messages. Scope flags are mutually exclusive — default is "messages where you're a participant"; pass `--with`, `--between`, `--thread`, or `--all` to broaden or narrow. `--format text`/`md` renders a human-readable transcript (with thread indentation under `--thread`). See [Reviewing conversations](#reviewing-conversations). |
 
 Every command accepts `--session <id>` to override session detection.
@@ -236,6 +237,42 @@ agenttalk history --thread 17 --format md
 # everything in the last hour, all participants
 agenttalk history --all --since 1h --format text
 ```
+
+## Cleaning up identities
+
+The registry accumulates agents over time — old test runs, retired roles,
+one-off sessions. `agenttalk retire` is the cleanup verb, with three
+levels of destruction:
+
+- **Soft retire (default)** — `agenttalk retire [--name X]` sets a
+  `retired_at` timestamp on the row, clears the session binding, hides
+  the agent from `list`, and rejects new `send`s addressed to it.
+  Message history is preserved. Reversible: re-registering the same
+  name resurrects it with the same history.
+- **Hard delete** — `agenttalk retire --name X --hard` deletes the row
+  entirely. Messages stay (history queryable via `--all`).
+- **Hard delete + purge** — `agenttalk retire --name X --hard --purge-messages`
+  also deletes every message where this agent was sender or recipient.
+  True full cleanup; irreversible.
+
+Bulk cleanup workflow for accumulated old agents:
+
+```sh
+# preview which agents would be retired
+agenttalk retire --inactive-since 7d --dry-run
+
+# do it (soft retire)
+agenttalk retire --inactive-since 7d
+
+# see what's been retired
+agenttalk list --retired-only
+```
+
+The role-handover pattern (the one v8-engine-manager organically
+landed on): agent A retires when its session is done, agent B
+re-registers the same name in a new session and inherits the message
+history — `retired_at` clears automatically. No `unretire` command
+exists; re-registering is the resurrection.
 
 ## Telling an agent how to use it
 
